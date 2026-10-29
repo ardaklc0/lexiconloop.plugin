@@ -15,12 +15,14 @@ local NetworkMgr = require("ui/network/manager")
 local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger = require("logger")
 local util = require("util")
 local TextViewer = require("ui/widget/textviewer")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
 local BUTTON_ID = "lexiconloop"
+local installLookupInputHook
 
 local LexiconLoop = WidgetContainer:extend{
     name = "lexiconloop",
@@ -32,6 +34,11 @@ function LexiconLoop:init()
     self.api = Api:new(self.settings)
     self.ui.menu:registerToMainMenu(self)
     self.dict_button_registered = self:registerDictButton()
+    LexiconLoop._active = self
+    -- Optional extra; if it fails, KOReader and the rest of the plugin keep working.
+    local ok, err = pcall(installLookupInputHook)
+    if not ok then logger.warn("LexiconLoop: lookup dialog hook disabled:", err)
+    else logger.info("LexiconLoop: init, lookup hook ready:", LexiconLoop._lookup_hooked == true) end
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -385,12 +392,13 @@ function LexiconLoop:getSentence(word)
     return #sentence > 400 and sentence:sub(1, 400) or sentence
 end
 
-function LexiconLoop:addWordFromPopup(dict_popup, on_result)
+-- word_override: a word typed by the user (the lookup dialog) instead of the popup's own word.
+function LexiconLoop:addWordFromPopup(dict_popup, on_result, word_override)
     if not self:isConfigured() then
         self:notify(_("Lexicon Loop is not set up. Open Tools > Lexicon Loop to log in and choose a workspace and folder."), 7)
         return false
     end
-    local word = dict_popup.lookupword
+    local word = word_override or dict_popup.lookupword
     local doc_props = dict_popup.ui and dict_popup.ui.doc_props
     local title = doc_props and doc_props.display_title
     local fields = {
@@ -400,7 +408,8 @@ function LexiconLoop:addWordFromPopup(dict_popup, on_result)
         source_language = self.settings:readSetting("source_language") or Config.default_source_language,
         target_language = self.settings:readSetting("target_language") or Config.default_target_language,
     }
-    local definition = self:getDefinition(dict_popup)
+    -- The popup's definition belongs to the looked-up form, not to a word typed by the user.
+    local definition = word_override and "" or self:getDefinition(dict_popup)
     self:runOnline(function()
         self:withBusy(_("Saving to Lexicon Loop..."), function()
             -- Meaning and CEFR come from Gemini; without a key or on failure, use the
@@ -540,6 +549,80 @@ function LexiconLoop:onDictButtonsReady(dict_popup, buttons)
         font_bold = false,
         callback = function() self:onButtonTapped(dict_popup) end,
     }})
+end
+
+----------------------------------------------------------------------------------------------------
+-- Pencil button of the dictionary popup: "Enter a word or phrase to look up".
+-- KOReader builds its buttons inline, so wrap the dialog creation and add our button on top.
+-- This lets you save the exact form from the book (e.g. "entgegenkommend") when the dictionary
+-- only found a related entry ("entgegenkommen").
+----------------------------------------------------------------------------------------------------
+
+-- Our row on top of the lookup dialog. Every step is guarded: on any error the dialog
+-- is still built exactly as KOReader would build it, just without our button.
+local function addLookupButton(args, popup, plugin, holder)
+    if type(args) ~= "table" or type(args.buttons) ~= "table" then return end
+    table.insert(args.buttons, 1, {{
+        text = BUTTON_TEXT,
+        callback = function()
+            local ok, err = pcall(function()
+                local dialog = holder.dialog
+                if not dialog then return end
+                local word = util.trim(((dialog:getInputText() or ""):gsub("%s+", " ")))
+                if word == "" then return end
+                UIManager:close(dialog)
+                plugin:addWordFromPopup(popup, function(result, fields)
+                    pcall(popup.onClose, popup)
+                    plugin:showSummary(result, fields)
+                end, word)
+            end)
+            if not ok then
+                logger.warn("LexiconLoop: lookup dialog button failed:", err)
+                plugin:notify(T(_("Lexicon Loop error: %1"), tostring(err)), 6)
+            end
+        end,
+    }})
+end
+
+installLookupInputHook = function()
+    if LexiconLoop._lookup_hooked then return end
+    local ok, DictQuickLookup = pcall(require, "ui/widget/dictquicklookup")
+    if not ok or type(DictQuickLookup) ~= "table" or type(DictQuickLookup.lookupInputWord) ~= "function" then
+        logger.warn("LexiconLoop: DictQuickLookup.lookupInputWord not found, lookup dialog button disabled")
+        return
+    end
+    LexiconLoop._lookup_hooked = true
+
+    local original_lookup = DictQuickLookup.lookupInputWord
+    DictQuickLookup.lookupInputWord = function(popup, ...)
+        local plugin = LexiconLoop._active
+        logger.info("LexiconLoop: lookup dialog opening, plugin active:", plugin ~= nil)
+        if not plugin then return original_lookup(popup, ...) end
+
+        -- Swap InputDialog.new only for the one dialog this call creates, then put it back.
+        -- rawget: "new" is normally inherited, so restoring nil brings back the original.
+        local own_new = rawget(InputDialog, "new")
+        local wrapper
+        wrapper = function(class, args, ...)
+            if rawget(InputDialog, "new") == wrapper then InputDialog.new = own_new end
+            local holder = {}
+            local added, err = pcall(addLookupButton, args, popup, plugin, holder)
+            if not added then logger.warn("LexiconLoop: could not add lookup button:", err)
+            else logger.info("LexiconLoop: lookup button added, rows:", type(args) == "table" and type(args.buttons) == "table" and #args.buttons or "?") end
+            holder.dialog = InputDialog.new(class, args, ...)
+            return holder.dialog
+        end
+        InputDialog.new = wrapper
+
+        -- lookupInputWord returns nothing; it only builds and shows the dialog.
+        local call_ok, err = pcall(original_lookup, popup, ...)
+        if rawget(InputDialog, "new") == wrapper then
+            -- The wrapper was never called: the dialog was built some other way.
+            logger.warn("LexiconLoop: lookup dialog was not created through InputDialog.new")
+            InputDialog.new = own_new
+        end
+        if not call_ok then error(err, 0) end
+    end
 end
 
 return LexiconLoop
